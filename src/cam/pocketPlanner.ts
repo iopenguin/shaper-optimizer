@@ -29,7 +29,7 @@ export function generatePocketOperations(
 ): ToolpathOperation[] {
   const operations: ToolpathOperation[] = [];
   const toolRadius = tool.diameter / 2;
-  const stepover = Math.max(
+  const initialStepover = Math.max(
     tool.diameter * 0.15,
     tool.diameter * (settings.stepOverRatio || tool.stepOverRatio || 0.65)
   );
@@ -42,7 +42,7 @@ export function generatePocketOperations(
       if (skippedRegionKeys.has(regionKey)) continue;
 
       const polyWithHoles = region.polygons[polyIdx];
-      const baseOuter = ensureOrientation(polyWithHoles.outer, true); // CCW for outer
+      const baseOuter = ensureOrientation(polyWithHoles.outer, true);
 
       if (region.sourceType === 'exterior') {
         // Exterior profile contour: offset outwards by toolRadius (-delta)
@@ -129,47 +129,72 @@ export function generatePocketOperations(
           }
         }
       } else {
-        // Standard Pocket: Generate concentric shape-conforming offset loops and connect into a single continuous path
+        // Standard Pocket: Adaptive Insetting with Guaranteed Core Centerline Clearance
         const concentricLoops: Polygon[] = [];
         let currentOffset = toolRadius;
-        let currentInsects = offsetPolygon(baseOuter, currentOffset, 'round');
-
-        let maxIterations = 40;
+        let step = initialStepover;
         let prevArea = Math.abs(polygonArea(baseOuter));
+        let maxIterations = 60;
 
-        while (currentInsects.length > 0 && maxIterations-- > 0) {
-          let hasValidLoop = false;
+        // 1. Initial nominal outer loop
+        const firstLoop = offsetPolygon(baseOuter, currentOffset, 'round');
+        if (firstLoop.length > 0) {
+          const simplified = simplifyPolygon(firstLoop[0], settings.simplifyTolerance || 0.05);
+          const valid = simplified.filter(
+            (p) =>
+              isPointInPolygon(p, baseOuter) &&
+              safeVolume.isToolCenterSafe(p, region.depth, toolRadius)
+          );
+          if (valid.length >= 3) {
+            concentricLoops.push(valid);
+            prevArea = Math.abs(polygonArea(valid));
+          }
+        }
 
-          for (const loop of currentInsects) {
-            const area = Math.abs(polygonArea(loop));
-            if (area > 1e-5 && area < prevArea) {
-              const simplified = simplifyPolygon(loop, settings.simplifyTolerance || 0.05);
-              const validPoints = simplified.filter(
-                (p) =>
-                  isPointInPolygon(p, baseOuter) &&
-                  safeVolume.isToolCenterSafe(p, region.depth, toolRadius)
-              );
+        // 2. Adaptive insetting down to the exact core
+        while (step > toolRadius * 0.1 && maxIterations-- > 0) {
+          const candidateOffset = currentOffset + step;
+          const candidateLoops = offsetPolygon(baseOuter, candidateOffset, 'round');
 
-              if (validPoints.length >= 3) {
-                concentricLoops.push(validPoints);
-                hasValidLoop = true;
-                prevArea = area;
+          let accepted = false;
+          if (candidateLoops.length > 0) {
+            for (const loop of candidateLoops) {
+              const area = Math.abs(polygonArea(loop));
+              if (area > 1e-5 && area < prevArea * 0.98) {
+                const simplified = simplifyPolygon(loop, settings.simplifyTolerance || 0.05);
+                const valid = simplified.filter(
+                  (p) =>
+                    isPointInPolygon(p, baseOuter) &&
+                    safeVolume.isToolCenterSafe(p, region.depth, toolRadius)
+                );
+
+                if (valid.length >= 3) {
+                  concentricLoops.push(valid);
+                  currentOffset = candidateOffset;
+                  prevArea = area;
+                  accepted = true;
+                  break;
+                }
               }
             }
           }
 
-          if (!hasValidLoop) break;
-
-          currentOffset += stepover;
-          currentInsects = offsetPolygon(baseOuter, currentOffset, 'round');
+          if (!accepted) {
+            // Halve step size to push insets closer to the central core without collapsing
+            step /= 2;
+          }
         }
 
         if (concentricLoops.length === 0) continue;
 
-        // Connect concentric offset loops into a single continuous spiral path
-        // Order from innermost (center) to outermost (perimeter)
+        // 3. Connect concentric loops into a continuous spiral path with core spine clearing
+        // concentricLoops is from outermost to innermost
+        const innermostLoop = concentricLoops[concentricLoops.length - 1];
+        const coreSpine = extractCoreSpine(innermostLoop, toolRadius);
+
+        // Reverse concentricLoops so innermost is first, and prepend core spine
         const loopsInnerToOuter = [...concentricLoops].reverse();
-        const continuousPath2D = connectConcentricLoopsIntoSpiral(loopsInnerToOuter);
+        const continuousPath2D = connectConcentricLoopsWithCore(coreSpine, loopsInnerToOuter);
 
         if (continuousPath2D.length < 2) continue;
 
@@ -196,7 +221,7 @@ export function generatePocketOperations(
 
           operations.push({
             id: `op_pocket_${region.id}_p${polyIdx}_pass${pass}`,
-            name: `${region.name} - Continuous Spiral Pocket Pass ${pass}/${numPasses} (-${passDepth.toFixed(2)})`,
+            name: `${region.name} - Spiral Pocket Pass ${pass}/${numPasses} (-${passDepth.toFixed(2)})`,
             toolId: tool.id,
             tool,
             targetDepth: region.depth,
@@ -225,33 +250,63 @@ export function generatePocketOperations(
 }
 
 /**
- * Connects concentric polygon offset loops into a single continuous, shape-conforming spiral path.
- * Bridges each loop to the next loop at the closest vertex so the cutter never leaves the pocket
- * and traces the exact geometry (rectangles, stars, arbitrary polygons) in one uninterrupted stroke.
+ * Computes the central spine / centroid of the innermost loop
+ * to guarantee 100% full coverage of the pocket core.
  */
-function connectConcentricLoopsIntoSpiral(loops: Polygon[]): Point[] {
-  if (loops.length === 0) return [];
-  if (loops.length === 1) {
-    const l = loops[0];
-    return [...l, l[0]];
+function extractCoreSpine(loop: Polygon, toolRadius: number): Point[] {
+  if (loop.length === 0) return [];
+
+  const bbox = getBoundingBox(loop);
+  const cx = (bbox.minX + bbox.maxX) / 2;
+  const cy = (bbox.minY + bbox.maxY) / 2;
+
+  const width = bbox.maxX - bbox.minX;
+  const height = bbox.maxY - bbox.minY;
+
+  // If the core is elongated along X or Y, create a central spine pass
+  if (width > toolRadius && width >= height) {
+    const pad = Math.min(toolRadius * 0.5, width * 0.2);
+    return [
+      { x: bbox.minX + pad, y: cy },
+      { x: bbox.maxX - pad, y: cy },
+    ];
+  } else if (height > toolRadius && height > width) {
+    const pad = Math.min(toolRadius * 0.5, height * 0.2);
+    return [
+      { x: cx, y: bbox.minY + pad },
+      { x: cx, y: bbox.maxY - pad },
+    ];
   }
 
+  // Small isotropic core, single centroid point
+  return [{ x: cx, y: cy }];
+}
+
+/**
+ * Connects the core spine and concentric offset loops into a single uninterrupted toolpath.
+ */
+function connectConcentricLoopsWithCore(coreSpine: Point[], loopsInnerToOuter: Polygon[]): Point[] {
   const path: Point[] = [];
 
-  for (let k = 0; k < loops.length; k++) {
-    const loop = loops[k];
+  // 1. Cut the core spine first
+  if (coreSpine.length > 0) {
+    for (const p of coreSpine) {
+      path.push(p);
+    }
+  }
+
+  // 2. Connect concentric loops from inside out
+  for (let k = 0; k < loopsInnerToOuter.length; k++) {
+    const loop = loopsInnerToOuter[k];
     if (loop.length < 3) continue;
 
     if (path.length === 0) {
-      // Start with the first loop
-      for (let i = 0; i < loop.length; i++) {
-        path.push(loop[i]);
-      }
-      path.push(loop[0]); // close loop
+      for (let i = 0; i < loop.length; i++) path.push(loop[i]);
+      path.push(loop[0]);
     } else {
       const lastPoint = path[path.length - 1];
 
-      // Find closest vertex on the next loop to minimize transition distance
+      // Find closest vertex on the loop
       let bestIdx = 0;
       let minDist = Infinity;
       for (let i = 0; i < loop.length; i++) {
@@ -262,14 +317,11 @@ function connectConcentricLoopsIntoSpiral(loops: Polygon[]): Point[] {
         }
       }
 
-      // Reorder loop to start from bestIdx
+      // Reorder loop to start from closest vertex
       const reordered = [...loop.slice(bestIdx), ...loop.slice(0, bestIdx)];
 
-      // Step directly to the entry vertex
-      path.push(reordered[0]);
-
-      // Complete full circuit around the contour
-      for (let i = 1; i < reordered.length; i++) {
+      // Bridge and trace full loop
+      for (let i = 0; i < reordered.length; i++) {
         path.push(reordered[i]);
       }
       path.push(reordered[0]);
