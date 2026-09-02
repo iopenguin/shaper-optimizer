@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<svg version="1.1" xmlns="http://www.w3.org/2000/svg" xmlns:shaper="http://www.shapertools.com/namespaces/shaper" width="200mm" height="120mm" viewBox="0 0 200 120">
+  <rect id="stock_outline" x="10" y="10" width="180" height="100" fill="#ffffff" stroke="#000000" stroke-width="0.254" shaper:pathType="exterior" shaper:cutDepth="12.0mm" />
+  <rect id="edge_slot_through" x="10" y="46.825" width="60" height="6.35" fill="#000000" stroke="#000000" stroke-width="0.254" shaper:pathType="pocket" shaper:cutDepth="12.0mm" />
+  <rect id="center_pocket" x="80" y="35" width="40" height="50" fill="#808080" stroke="#000000" stroke-width="0.254" shaper:pathType="pocket" shaper:cutDepth="6.0mm" />
+</svg>
