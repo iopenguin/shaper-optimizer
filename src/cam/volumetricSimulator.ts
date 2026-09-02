@@ -1,6 +1,6 @@
 import * as THREE from 'three';
 import { CAMProject, ToolDefinition, ToolpathOperation, ToolpathPoint } from '../types';
-import { dist, pt } from '../geometry/point';
+import { dist } from '../geometry/point';
 
 export interface VolumetricSimulationResult {
   geometry: THREE.BufferGeometry;
@@ -13,47 +13,41 @@ export interface VolumetricSimulationResult {
   }[];
 }
 
-interface DepthInterval {
-  zBottom: number; // Bottom of solid span
-  zTop: number; // Top of solid span
-}
-
 /**
  * Multi-layer Volumetric CNC Machining Simulator.
  * Models true 3D tool sweeps, undercuts (dovetails, T-slots, finger pulls),
- * and dynamic material removal at high resolution.
+ * and dynamic material removal with exact coordinate alignment.
  */
 export class VolumetricSimulator {
   private width: number;
   private height: number;
   private thickness: number;
-  private resolution: number; // cells per mm or inch
   private nx: number;
   private ny: number;
+  private cellDx: number;
+  private cellDy: number;
 
-  // Multi-span depth interval grid: each cell has 1 or more solid [zBottom, zTop] spans
-  // For standard cuts, topSpan: zTop is lowered.
-  // For undercuts, an interior interval is subtracted, splitting [zBottom, zTop] into two spans (overhang ceiling + floor).
-  private gridTopZ: Float32Array; // Top surface Z for fast rendering (<= 0)
-  private gridBottomZ: Float32Array; // Lowest cut floor Z
-  private gridCeilingZ: Float32Array; // Undercut ceiling Z (if overhang exists)
-  private hasUndercut: Uint8Array; // 1 if cell has an overhang / undercut
+  private gridTopZ: Float32Array; // Top surface Z (<= 0)
+  private gridBottomZ: Float32Array; // Cut floor Z
+  private gridCeilingZ: Float32Array; // Undercut ceiling Z
+  private hasUndercut: Uint8Array; // 1 if cell has an undercut
 
   constructor(width: number, height: number, thickness: number, isInch = false) {
     this.width = Math.max(width, 1);
     this.height = Math.max(height, 1);
     this.thickness = Math.max(thickness, 0.1);
 
-    // Target ~5 samples per mm (or ~120 samples per inch for Imperial)
-    // Clamped for smooth 60fps WebGL rendering performance
+    // Resolution: ~4-5 samples per mm (or ~100 samples per inch)
     const targetPPM = isInch ? 80 : 3.5;
-    this.nx = Math.min(600, Math.max(64, Math.round(this.width * targetPPM)));
-    this.ny = Math.min(400, Math.max(64, Math.round(this.height * targetPPM)));
-    this.resolution = this.nx / this.width;
+    this.nx = Math.min(500, Math.max(64, Math.round(this.width * targetPPM)));
+    this.ny = Math.min(350, Math.max(64, Math.round(this.height * targetPPM)));
+
+    this.cellDx = this.width / (this.nx - 1);
+    this.cellDy = this.height / (this.ny - 1);
 
     const totalCells = this.nx * this.ny;
-    this.gridTopZ = new Float32Array(totalCells); // Initialized to 0.0 (top surface)
-    this.gridBottomZ = new Float32Array(totalCells); // Initialized to 0.0
+    this.gridTopZ = new Float32Array(totalCells);
+    this.gridBottomZ = new Float32Array(totalCells);
     this.gridCeilingZ = new Float32Array(totalCells);
     this.hasUndercut = new Uint8Array(totalCells);
   }
@@ -75,29 +69,29 @@ export class VolumetricSimulator {
     cutDepth: number
   ) {
     const maxToolRadius = (tool.diameter || 6.35) / 2;
-    const targetZ = -Math.abs(cutDepth); // negative Z is into the material
+    const targetZ = -Math.abs(cutDepth);
     const isDovetailOrUndercut =
       tool.category === 'dovetail' ||
       tool.sections?.some((s) => (s.taperAngle && s.taperAngle < 0) || s.type === 'inside-arc');
 
-    // Bounding box of segment in grid coordinates
-    const minX = Math.max(0, Math.floor((Math.min(p1.x, p2.x) - maxToolRadius) * this.resolution));
-    const maxX = Math.min(this.nx - 1, Math.ceil((Math.max(p1.x, p2.x) + maxToolRadius) * this.resolution));
-    const minY = Math.max(0, Math.floor((Math.min(p1.y, p2.y) - maxToolRadius) * this.resolution));
-    const maxY = Math.min(this.ny - 1, Math.ceil((Math.max(p1.y, p2.y) + maxToolRadius) * this.resolution));
+    // Bounding box of segment in exact grid indices
+    const minX = Math.max(0, Math.floor((Math.min(p1.x, p2.x) - maxToolRadius) / this.cellDx));
+    const maxX = Math.min(this.nx - 1, Math.ceil((Math.max(p1.x, p2.x) + maxToolRadius) / this.cellDx));
+    const minY = Math.max(0, Math.floor((Math.min(p1.y, p2.y) - maxToolRadius) / this.cellDy));
+    const maxY = Math.min(this.ny - 1, Math.ceil((Math.max(p1.y, p2.y) + maxToolRadius) / this.cellDy));
 
     const segDx = p2.x - p1.x;
     const segDy = p2.y - p1.y;
     const segLenSq = segDx * segDx + segDy * segDy;
 
     for (let gy = minY; gy <= maxY; gy++) {
-      const worldY = gy / this.resolution;
+      const worldY = gy * this.cellDy;
       const rowOffset = gy * this.nx;
 
       for (let gx = minX; gx <= maxX; gx++) {
-        const worldX = gx / this.resolution;
+        const worldX = gx * this.cellDx;
 
-        // Calculate distance from (worldX, worldY) to segment (p1 -> p2)
+        // Distance from (worldX, worldY) to segment (p1 -> p2)
         let t = 0;
         if (segLenSq > 1e-8) {
           t = Math.max(0, Math.min(1, ((worldX - p1.x) * segDx + (worldY - p1.y) * segDy) / segLenSq));
@@ -108,26 +102,19 @@ export class VolumetricSimulator {
 
         if (distToCenter <= maxToolRadius) {
           const idx = rowOffset + gx;
-
-          // Compute tool profile cut depth at distance `distToCenter`
           const toolCarve = this.evaluateToolProfileDepth(tool, distToCenter, targetZ);
 
           if (!isDovetailOrUndercut) {
-            // Standard cut: lower the top surface
             if (toolCarve.zFloor < this.gridTopZ[idx]) {
               this.gridTopZ[idx] = Math.max(-this.thickness, toolCarve.zFloor);
               this.gridBottomZ[idx] = this.gridTopZ[idx];
             }
           } else {
-            // Undercut / Dovetail cut:
-            // If the neck/top diameter is narrower than bottom diameter, we carve an interior cavity!
             if (toolCarve.zCeiling !== undefined && toolCarve.zCeiling < 0) {
-              // Create / update undercut span
               this.hasUndercut[idx] = 1;
               this.gridCeilingZ[idx] = Math.min(this.gridCeilingZ[idx] || 0, toolCarve.zCeiling);
               this.gridBottomZ[idx] = Math.max(-this.thickness, toolCarve.zFloor);
             } else {
-              // Direct top-down cut
               if (toolCarve.zFloor < this.gridTopZ[idx]) {
                 this.gridTopZ[idx] = Math.max(-this.thickness, toolCarve.zFloor);
                 this.gridBottomZ[idx] = this.gridTopZ[idx];
@@ -139,10 +126,6 @@ export class VolumetricSimulator {
     }
   }
 
-  /**
-   * Evaluates the cutting surface depth Z for a given distance from tool center.
-   * Handles flat endmills, V-bits (60°/90°), ball nose hemispherical tips, roundovers, and dovetails.
-   */
   private evaluateToolProfileDepth(
     tool: ToolDefinition,
     distFromCenter: number,
@@ -152,14 +135,12 @@ export class VolumetricSimulator {
     const maxR = (tool.diameter || 6.35) / 2;
 
     if (sections.length === 0 || tool.category === 'endmill' || sections[0].type === 'straight') {
-      // Standard Flat Endmill: Flat bottom at targetZ
       return { zFloor: targetZ };
     }
 
     const firstSec = sections[0];
 
     if (tool.category === 'v-bit' || firstSec.type === 'angled') {
-      // V-Groove: Conical angled floor
       const taperAngle = firstSec.taperAngle || 60;
       const halfAngleRad = (taperAngle * Math.PI) / 360;
       const zOffset = distFromCenter / Math.tan(halfAngleRad);
@@ -167,7 +148,6 @@ export class VolumetricSimulator {
     }
 
     if (tool.category === 'ball-nose' || firstSec.type === 'outside-arc') {
-      // Ball Nose: Semicircular bottom profile
       if (distFromCenter <= maxR) {
         const sphereHeight = maxR - Math.sqrt(Math.max(0, maxR * maxR - distFromCenter * distFromCenter));
         return { zFloor: Math.min(0, targetZ + sphereHeight) };
@@ -176,16 +156,12 @@ export class VolumetricSimulator {
     }
 
     if (tool.category === 'dovetail' || (firstSec.taperAngle && firstSec.taperAngle < 0)) {
-      // Inverted Taper Dovetail: Bottom diameter is wider than top entry neck
-      // zFloor is at targetZ; undercut ceiling is formed above the wide flutes
       const angleRad = (Math.abs(firstSec.taperAngle || 8) * Math.PI) / 180;
       const endR = (firstSec.endDiameter || tool.diameter * 0.75) / 2;
 
       if (distFromCenter <= endR) {
-        // Direct vertical slot through neck
         return { zFloor: targetZ };
       } else if (distFromCenter <= maxR) {
-        // Undercut wing: solid ceiling exists above it!
         const undercutH = (distFromCenter - endR) / Math.tan(angleRad);
         const zCeil = Math.min(0, targetZ + firstSec.height - undercutH);
         return { zFloor: targetZ, zCeiling: zCeil };
@@ -195,22 +171,16 @@ export class VolumetricSimulator {
     return { zFloor: targetZ };
   }
 
-  /**
-   * Generates a realistic 3D mesh (Three.js BufferGeometry) from the volumetric field.
-   * Includes top surface, carved floor cavities, and vertical side walls.
-   */
   public generateSurfaceMesh(): THREE.BufferGeometry {
     const positions: number[] = [];
     const normals: number[] = [];
     const uvs: number[] = [];
     const colors: number[] = [];
 
-    const dx = this.width / (this.nx - 1);
-    const dy = this.height / (this.ny - 1);
     const stockHalfW = this.width / 2;
     const stockHalfH = this.height / 2;
 
-    // 1. Generate Continuous Top/Carved Surface Grid
+    // 1. Generate Top/Carved Surface Grid
     for (let gy = 0; gy < this.ny - 1; gy++) {
       for (let gx = 0; gx < this.nx - 1; gx++) {
         const idx00 = gy * this.nx + gx;
@@ -218,17 +188,16 @@ export class VolumetricSimulator {
         const idx01 = (gy + 1) * this.nx + gx;
         const idx11 = (gy + 1) * this.nx + (gx + 1);
 
-        const x0 = gx * dx - stockHalfW;
-        const x1 = (gx + 1) * dx - stockHalfW;
-        const y0 = -(gy * dy - stockHalfH);
-        const y1 = -((gy + 1) * dy - stockHalfH);
+        const x0 = gx * this.cellDx - stockHalfW;
+        const x1 = (gx + 1) * this.cellDx - stockHalfW;
+        const y0 = -(gy * this.cellDy - stockHalfH);
+        const y1 = -((gy + 1) * this.cellDy - stockHalfH);
 
         const z00 = this.gridTopZ[idx00];
         const z10 = this.gridTopZ[idx10];
         const z01 = this.gridTopZ[idx01];
         const z11 = this.gridTopZ[idx11];
 
-        // Triangle 1: (0,0) -> (1,0) -> (0,1)
         addQuad(
           positions,
           normals,
@@ -244,7 +213,7 @@ export class VolumetricSimulator {
           (gy + 1) / this.ny
         );
 
-        // If undercut exists, render the lower floor cavity quad
+        // Lower floor for undercuts
         if (this.hasUndercut[idx00] || this.hasUndercut[idx10] || this.hasUndercut[idx01] || this.hasUndercut[idx11]) {
           const fb00 = this.gridBottomZ[idx00];
           const fb10 = this.gridBottomZ[idx10];
@@ -264,46 +233,44 @@ export class VolumetricSimulator {
             gy / this.ny,
             (gx + 1) / this.nx,
             (gy + 1) / this.ny,
-            true // dark cut color
+            true
           );
         }
       }
     }
 
-    // 2. Add Workpiece Outer Perimeter Skirt Walls down to -thickness
+    // 2. Outer Skirt Walls
     const zBase = -this.thickness;
 
-    // Top & Bottom edges
     for (let gx = 0; gx < this.nx - 1; gx++) {
-      const x0 = gx * dx - stockHalfW;
-      const x1 = (gx + 1) * dx - stockHalfW;
+      const x0 = gx * this.cellDx - stockHalfW;
+      const x1 = (gx + 1) * this.cellDx - stockHalfW;
 
-      // North side (gy = 0)
+      // North side
       const yn = -(0 - stockHalfH);
       const zn0 = this.gridTopZ[gx];
       const zn1 = this.gridTopZ[gx + 1];
       addWall(positions, normals, uvs, colors, x0, yn, zn0, x1, yn, zn1, zBase, 0, 1, 0);
 
-      // South side (gy = ny - 1)
-      const ys = -((this.ny - 1) * dy - stockHalfH);
+      // South side
+      const ys = -((this.ny - 1) * this.cellDy - stockHalfH);
       const zs0 = this.gridTopZ[(this.ny - 1) * this.nx + gx];
       const zs1 = this.gridTopZ[(this.ny - 1) * this.nx + gx + 1];
       addWall(positions, normals, uvs, colors, x1, ys, zs1, x0, ys, zs0, zBase, 0, -1, 0);
     }
 
-    // Left & Right edges
     for (let gy = 0; gy < this.ny - 1; gy++) {
-      const y0 = -(gy * dy - stockHalfH);
-      const y1 = -((gy + 1) * dy - stockHalfH);
+      const y0 = -(gy * this.cellDy - stockHalfH);
+      const y1 = -((gy + 1) * this.cellDy - stockHalfH);
 
-      // West side (gx = 0)
+      // West side
       const xw = 0 - stockHalfW;
       const zw0 = this.gridTopZ[gy * this.nx];
       const zw1 = this.gridTopZ[(gy + 1) * this.nx];
       addWall(positions, normals, uvs, colors, xw, y1, zw1, xw, y0, zw0, zBase, -1, 0, 0);
 
-      // East side (gx = nx - 1)
-      const xe = (this.nx - 1) * dx - stockHalfW;
+      // East side
+      const xe = (this.nx - 1) * this.cellDx - stockHalfW;
       const ze0 = this.gridTopZ[gy * this.nx + (this.nx - 1)];
       const ze1 = this.gridTopZ[(gy + 1) * this.nx + (this.nx - 1)];
       addWall(positions, normals, uvs, colors, xe, y0, ze0, xe, y1, ze1, zBase, 1, 0, 0);
@@ -348,24 +315,19 @@ function addQuad(
   forceDarkCut = false,
   nx = 0, ny = 0, nz = 1
 ) {
-  // Triangle 1: p0, p1, p2
   pos.push(x0, y0, z0, x1, y1, z1, x2, y2, z2);
   norm.push(nx, ny, nz, nx, ny, nz, nx, ny, nz);
   uv.push(u0, v0, u1, v0, u1, v1);
 
-  // Triangle 2: p0, p2, p3
   pos.push(x0, y0, z0, x2, y2, z2, x3, y3, z3);
   norm.push(nx, ny, nz, nx, ny, nz, nx, ny, nz);
   uv.push(u0, v0, u1, v1, u0, v1);
 
-  // Material vertex coloring: natural wood for uncut top (z=0), darker machined wood for cut floors (z < 0)
   for (let i = 0; i < 6; i++) {
     const isCut = forceDarkCut || z0 < -0.05 || z1 < -0.05 || z2 < -0.05;
     if (isCut) {
-      // Machined End-Grain Wood Color
       col.push(0.55, 0.38, 0.22);
     } else {
-      // Natural Maple Face Color
       col.push(0.82, 0.68, 0.48);
     }
   }
@@ -381,7 +343,6 @@ function addWall(
   zBase: number,
   nx: number, ny: number, nz: number
 ) {
-  // Quad from (x0, y0, zTop0) to (x1, y1, zTop1) down to zBase
   pos.push(x0, y0, zTop0, x1, y1, zTop1, x1, y1, zBase);
   norm.push(nx, ny, nz, nx, ny, nz, nx, ny, nz);
   uv.push(0, 0, 1, 0, 1, 1);
@@ -395,12 +356,9 @@ function addWall(
   }
 }
 
-/**
- * Runs full or partial toolpath simulation and checks for shank collisions.
- */
 export function runVolumetricSimulation(
   project: CAMProject,
-  progress = 1.0 // 0.0 to 1.0
+  progress = 1.0
 ): VolumetricSimulationResult {
   const isInch = project.units === 'inch';
   const sim = new VolumetricSimulator(
@@ -419,13 +377,13 @@ export function runVolumetricSimulation(
 
   const targetDist = totalCutDist * progress;
   let accumDist = 0;
+  let done = false;
 
   for (const op of project.operations) {
-    if (!op.visible) continue;
+    if (!op.visible || done) continue;
     const tool = op.tool;
     const cutDepth = op.currentPassDepth;
 
-    // Check Shank / Collet Rub Collision
     const maxFluteLength = tool.fluteLength || (isInch ? 0.75 : 19.05);
     if (cutDepth > maxFluteLength + 1e-3) {
       const firstPt = op.segments[0]?.points[0] || { x: 0, y: 0, z: -cutDepth };
@@ -439,14 +397,23 @@ export function runVolumetricSimulation(
     }
 
     for (const seg of op.segments) {
-      if (seg.points.length < 2) continue;
+      if (seg.points.length < 2 || done) continue;
 
       for (let pIdx = 0; pIdx < seg.points.length - 1; pIdx++) {
         const p1 = seg.points[pIdx];
         const p2 = seg.points[pIdx + 1];
         const d = dist(p1, p2);
 
-        if (progress < 1.0 && accumDist > targetDist) {
+        if (progress < 1.0 && accumDist + d > targetDist) {
+          // Partial segment interpolation
+          const fraction = Math.max(0, (targetDist - accumDist) / (d || 1));
+          const pPartial: ToolpathPoint = {
+            x: p1.x + (p2.x - p1.x) * fraction,
+            y: p1.y + (p2.y - p1.y) * fraction,
+            z: p1.z + (p2.z - p1.z) * fraction,
+          };
+          sim.carveSegment(p1, pPartial, tool, cutDepth);
+          done = true;
           break;
         }
 

@@ -29,7 +29,7 @@ export const Visualizer3D: React.FC<Visualizer3DProps> = ({
   // Playback state
   const [isPlaying, setIsPlaying] = useState<boolean>(false);
   const [playbackProgress, setPlaybackProgress] = useState<number>(1.0);
-  const [playbackSpeed, setPlaybackSpeed] = useState<number>(1);
+  const [playbackSpeed, setPlaybackSpeed] = useState<number>(1.0);
   const animFrameRef = useRef<number | null>(null);
 
   // Display toggles
@@ -45,7 +45,7 @@ export const Visualizer3D: React.FC<Visualizer3DProps> = ({
   const stockThick = project.totalThickness || (isInch ? 0.75 : 12);
   const maxDim = Math.max(stockW, stockH, stockThick, 0.1);
 
-  // Playback loop
+  // Smooth, realistic playback loop
   useEffect(() => {
     if (!isPlaying) {
       if (animFrameRef.current) cancelAnimationFrame(animFrameRef.current);
@@ -58,7 +58,8 @@ export const Visualizer3D: React.FC<Visualizer3DProps> = ({
       lastTime = now;
 
       setPlaybackProgress((prev) => {
-        const speedMultiplier = playbackSpeed * 0.08;
+        // Base rate: ~50 seconds for full simulation at 1.0x speed
+        const speedMultiplier = playbackSpeed * 0.02;
         const next = prev + dt * speedMultiplier;
         if (next >= 1.0) {
           setIsPlaying(false);
@@ -123,7 +124,7 @@ export const Visualizer3D: React.FC<Visualizer3DProps> = ({
     const simResult = runVolumetricSimulation(project, playbackProgress);
     setCollisions(simResult.shankCollisions);
 
-    // Realistic Wood Material with Vertex Colors (Mapled face vs Dark end-grain cut floor)
+    // Realistic Wood Material with Vertex Colors
     const woodMat = new THREE.MeshStandardMaterial({
       vertexColors: true,
       roughness: 0.65,
@@ -167,10 +168,6 @@ export const Visualizer3D: React.FC<Visualizer3DProps> = ({
             const p2 = seg.points[pIdx + 1];
             const d = dist(p1, p2);
 
-            if (playbackProgress < 1.0 && accumDist > targetAnimDist) {
-              break;
-            }
-
             pts.push(
               new THREE.Vector3(
                 p1.x - stockW / 2,
@@ -191,6 +188,19 @@ export const Visualizer3D: React.FC<Visualizer3DProps> = ({
             }
 
             accumDist += d;
+            if (playbackProgress < 1.0 && accumDist > targetAnimDist) {
+              // Add final interpolated point
+              if (currentCutterPos) {
+                pts.push(
+                  new THREE.Vector3(
+                    currentCutterPos.x,
+                    currentCutterPos.y,
+                    currentCutterPos.z + 0.005 * maxDim
+                  )
+                );
+              }
+              break;
+            }
           }
 
           if (pts.length >= 2) {
@@ -202,6 +212,14 @@ export const Visualizer3D: React.FC<Visualizer3DProps> = ({
             const line = new THREE.Line(lineGeo, lineMat);
             workpieceGroup.add(line);
           }
+
+          if (playbackProgress < 1.0 && accumDist > targetAnimDist) {
+            break;
+          }
+        }
+
+        if (playbackProgress < 1.0 && accumDist > targetAnimDist) {
+          break;
         }
       }
     }
@@ -461,11 +479,11 @@ export const Visualizer3D: React.FC<Visualizer3DProps> = ({
           onChange={(e) => setPlaybackSpeed(parseFloat(e.target.value))}
           className="bg-slate-800 text-slate-300 text-xs border border-slate-700 rounded-lg px-2 py-1 outline-none shrink-0"
         >
+          <option value={0.25}>0.25x (Slow)</option>
           <option value={0.5}>0.5x</option>
-          <option value={1}>1.0x</option>
-          <option value={2}>2.0x</option>
-          <option value={5}>5.0x</option>
-          <option value={10}>10.0x</option>
+          <option value={1.0}>1.0x (Normal)</option>
+          <option value={2.0}>2.0x</option>
+          <option value={5.0}>5.0x</option>
         </select>
       </div>
 
