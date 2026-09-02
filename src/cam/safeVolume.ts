@@ -4,7 +4,6 @@ import {
   isPointInPolygon,
   isPointInPolygonWithHoles,
   distanceToPolygon,
-  dilatePolygon,
 } from '../geometry/polygon';
 
 export class SafeVolumeManager {
