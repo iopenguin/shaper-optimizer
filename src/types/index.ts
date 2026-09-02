@@ -19,18 +19,43 @@ export interface BoundingBox {
   height: number;
 }
 
+export type CutterSectionType = 'straight' | 'angled' | 'outside-arc' | 'inside-arc';
+
+export interface CutterSection {
+  id: string;
+  type: CutterSectionType;
+  diameter: number; // Major / starting diameter of this section
+  endDiameter?: number; // For angled/tapered sections (defaults to diameter if not set)
+  height: number; // Length along the Z-axis of this section
+  taperAngle?: number; // In degrees, positive = tapering down to smaller dia, negative = expanding down
+  radius?: number; // For outside-arc (fillet/roundover) or inside-arc (cove)
+}
+
+export type ToolCategory =
+  | 'endmill'
+  | 'v-bit'
+  | 'ball-nose'
+  | 'profile'
+  | 'surfacing'
+  | 'dovetail'
+  | 'specialty';
+
 export interface ToolDefinition {
   id: string;
   name: string;
-  diameter: number; // in mm or inches depending on project unit
+  diameter: number; // in mm or inches depending on project unit (max effective cut diameter)
+  colletDiameter?: number; // Shank / collet diameter (e.g. 0.25", 0.125", 8mm)
   fluteLength: number;
   maxStepDown: number;
-  stepOverRatio: number; // 0.1 to 0.9 (e.g. 0.6 = 60%)
+  stepOverRatio: number; // 0.1 to 0.9 (e.g. 0.65 = 65%)
   feedRate: number; // mm/min or in/min
   plungeRate: number;
   color: string;
   description?: string;
   enabled?: boolean;
+  category?: ToolCategory;
+  sku?: string;
+  sections: CutterSection[]; // Stack of cutter sections from collet down to tip
 }
 
 export type PathType = 'pocket' | 'interior' | 'exterior' | 'slot' | 'online' | 'guide';
@@ -58,6 +83,14 @@ export interface ToolpathSegment {
   feedRate?: number;
 }
 
+export type OperationType =
+  | 'pocket-clear'
+  | 'slot-single-pass'
+  | 'centerline-slot'
+  | 'profile-contour'
+  | 'rest-finishing'
+  | 'corner-cleanout';
+
 export interface ToolpathOperation {
   id: string;
   name: string;
@@ -67,37 +100,36 @@ export interface ToolpathOperation {
   passIndex: number;
   totalPasses: number;
   currentPassDepth: number;
-  type: 'centerline-slot' | 'pocket-clear' | 'profile-contour' | 'rest-finishing' | 'corner-cleanout';
+  type: OperationType;
   segments: ToolpathSegment[];
-  estimatedLength: number; // total cut distance in units
+  estimatedLength: number;
   estimatedTimeSec: number;
   visible: boolean;
   color: string;
 }
 
-export type UnitType = 'mm' | 'inch';
+export interface CAMSettings {
+  slotDetectionTolerance: number;
+  safeOvertravelMargin: number;
+  stepOverRatio: number;
+  climbMilling: boolean;
+  enableRestMachining: boolean;
+  cornerStrategy: 'square-overcut' | 'fillet' | 'dogbone' | 't-bone';
+  leadInRadius: number;
+  simplifyTolerance: number;
+}
 
-export type ExportFormat = 'both' | 'single' | 'multiple';
+export type ExportFormat = 'single' | 'multiple' | 'both';
+export type UnitType = 'mm' | 'inch';
 
 export interface ExportSettings {
   format: ExportFormat;
   includeGuideLayers: boolean;
   colorCodeByBit: boolean;
-  strokeWidth: number; // in units (default 0.010 in = 0.254 mm)
+  strokeWidth: number;
   includeShaperMetadata: boolean;
   units: UnitType;
-  prefix: string;
-}
-
-export interface CAMSettings {
-  slotDetectionTolerance: number; // tolerance to classify channel as exact bit width (e.g. 0.05 * tool diameter)
-  safeOvertravelMargin: number; // extra distance past boundary into safe air/depth (e.g. 1.0 * tool radius)
-  stepOverRatio: number; // default 0.65 (65%)
-  climbMilling: boolean;
-  enableRestMachining: boolean;
-  cornerStrategy: 'square-overcut' | 'dogbone' | 't-bone' | 'standard';
-  leadInRadius: number;
-  simplifyTolerance: number;
+  prefix?: string;
 }
 
 export interface CAMProject {

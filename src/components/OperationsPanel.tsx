@@ -11,6 +11,7 @@ import {
   ChevronLeft,
 } from 'lucide-react';
 import { CAMProject, ToolpathOperation } from '../types';
+import { BitProfilePreview } from './BitProfilePreview';
 
 interface OperationsPanelProps {
   project: CAMProject;
@@ -128,19 +129,26 @@ export const OperationsPanel: React.FC<OperationsPanelProps> = ({
               key={toolId}
               className="bg-slate-950/90 border border-slate-800 rounded-xl overflow-hidden shadow-sm"
             >
-              {/* Tool Group Header */}
-              <div className="px-3 py-2 bg-slate-800/60 border-b border-slate-800 flex items-center justify-between">
-                <div className="inline-flex items-center gap-2 truncate">
-                  <span
-                    className="w-2.5 h-2.5 rounded-full shrink-0 shadow-sm"
-                    style={{ backgroundColor: tool.color }}
-                  />
-                  <span className="text-xs font-semibold text-slate-200 truncate">
-                    Step {groupIdx + 1}: {tool.name}
-                  </span>
-                  <span className="text-[10px] text-slate-400 font-mono shrink-0">
-                    (Ø {tool.diameter} {units})
-                  </span>
+              {/* Tool Group Header with 2D Bit Profile Thumbnail */}
+              <div className="px-3 py-2.5 bg-slate-800/60 border-b border-slate-800 flex items-center justify-between">
+                <div className="inline-flex items-center gap-2.5 truncate">
+                  <div className="w-7 h-9 bg-slate-900 border border-slate-700/60 rounded flex items-center justify-center shrink-0 p-0.5 shadow-inner">
+                    <BitProfilePreview
+                      tool={tool}
+                      units={units}
+                      width={24}
+                      height={32}
+                      showDimensions={false}
+                    />
+                  </div>
+                  <div className="flex flex-col truncate">
+                    <span className="text-xs font-semibold text-slate-200 truncate">
+                      Step {groupIdx + 1}: {tool.name}
+                    </span>
+                    <span className="text-[10px] text-slate-400 font-mono">
+                      Ø {tool.diameter} {units} • {tool.category || 'endmill'}
+                    </span>
+                  </div>
                 </div>
 
                 <button
